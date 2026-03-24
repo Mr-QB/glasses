@@ -15,6 +15,7 @@ class HandPoseProcessor:
         min_tracking_confidence: float = 0.5,
     ) -> None:
         self.landmarker = None
+        self.status_message = "Hand pose not initialized."
         self.connections = [
             (0, 1),
             (1, 2),
@@ -41,39 +42,46 @@ class HandPoseProcessor:
         try:
             import mediapipe as mp
         except ImportError:
-            warnings.warn(
-                "MediaPipe not installed. Hand tracking is disabled. Install with: pip install mediapipe"
-            )
+            self.status_message = "MediaPipe not installed. Hand tracking is disabled. Install with: pip install mediapipe"
+            warnings.warn(self.status_message)
             return
 
         tasks = getattr(mp, "tasks", None)
         if tasks is None:
-            warnings.warn(
+            self.status_message = (
                 "MediaPipe tasks API not available. Hand tracking is disabled."
             )
+            warnings.warn(self.status_message)
             return
 
-        # Model path - download from https://storage.googleapis.com/mediapipe-models/hand_landmarker.task
         model_path = os.path.join(
             os.path.dirname(__file__), "..", "models", "hand_landmarker.task"
         )
         model_path = os.path.abspath(model_path)
 
         if not os.path.exists(model_path):
-            warnings.warn(
-                f"Hand landmarker model not found at {model_path}. Hand tracking is disabled."
-            )
+            self.status_message = f"Hand landmarker model not found at {model_path}. Hand tracking is disabled."
+            warnings.warn(self.status_message)
             return
 
         base_options = tasks.BaseOptions(model_asset_path=model_path)
+
         options = tasks.vision.HandLandmarkerOptions(
             base_options=base_options,
             num_hands=max_num_hands,
             min_hand_detection_confidence=min_detection_confidence,
             min_hand_presence_confidence=min_tracking_confidence,
+            min_tracking_confidence=min_tracking_confidence,
         )
         self.landmarker = tasks.vision.HandLandmarker.create_from_options(options)
         self._mp = mp
+        self.status_message = "MediaPipe hand tracking is enabled."
+
+    def is_enabled(self) -> bool:
+        return self.landmarker is not None
+
+    def get_status(self) -> str:
+        return self.status_message
 
     def detect(self, frame) -> List[List[Tuple[float, float]]]:
         if self.landmarker is None:

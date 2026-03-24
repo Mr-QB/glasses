@@ -1,11 +1,11 @@
 import cv2
+import traceback
 from queue import Empty, Full, Queue
 from threading import Thread
 from time import perf_counter
-from typing import List, Optional, Tuple
+from typing import Optional
 
 from vision.camera import open_camera
-from vision.hand_pose import HandPoseProcessor
 from vision.processor import FrameProcessor
 from vision.settings import VisionSettings
 
@@ -22,21 +22,30 @@ class VisionPipeline:
             model_path=settings.model_path,
             device=settings.yolo_device,
             use_fp16=settings.use_fp16,
-        )
-        self.hand_processor = HandPoseProcessor(
+            infer_imgsz=settings.infer_imgsz,
+            conf_threshold=settings.conf_threshold,
+            iou_threshold=settings.iou_threshold,
+            max_det=settings.max_det,
+            yoloe_prompts=settings.yoloe_prompts,
+            enable_hand_pose=settings.enable_hand_pose,
             max_num_hands=settings.max_num_hands,
-            min_detection_confidence=settings.hand_detection_confidence,
-            min_tracking_confidence=settings.hand_tracking_confidence,
+            hand_detection_confidence=settings.hand_detection_confidence,
+            hand_tracking_confidence=settings.hand_tracking_confidence,
+            enable_item_search=settings.enable_item_search,
+            lock_required_frames=settings.lock_required_frames,
+            center_threshold_px=settings.center_threshold_px,
+            center_hold_frames=settings.center_hold_frames,
+            hand_guidance_threshold_px=settings.hand_guidance_threshold_px,
+            track_lost_tolerance_frames=settings.track_lost_tolerance_frames,
+            contact_overlap_threshold=settings.contact_overlap_threshold,
         )
-        self.raw_frames_yolo: Queue = Queue(maxsize=settings.queue_size)
-        self.raw_frames_hands: Queue = Queue(maxsize=settings.queue_size)
+        self.raw_frames_segmentation: Queue = Queue(maxsize=settings.queue_size)
         self.processed_frames: Queue = Queue(maxsize=settings.queue_size)
-        self.hand_results: Queue = Queue(maxsize=settings.queue_size)
         self._running = False
         self._read_thread: Optional[Thread] = None
-        self._yolo_thread: Optional[Thread] = None
-        self._hand_thread: Optional[Thread] = None
-        self._latest_hands: List[List[Tuple[float, float]]] = []
+        self._segmentation_thread: Optional[Thread] = None
+        self._worker_error: Optional[str] = None
+        self._error_reported = False
 
     def start(self) -> None:
         if self._running:
@@ -44,11 +53,9 @@ class VisionPipeline:
 
         self._running = True
         self._read_thread = Thread(target=self._read_loop, daemon=True)
-        self._yolo_thread = Thread(target=self._yolo_loop, daemon=True)
-        self._hand_thread = Thread(target=self._hand_loop, daemon=True)
+        self._segmentation_thread = Thread(target=self._segmentation_loop, daemon=True)
         self._read_thread.start()
-        self._yolo_thread.start()
-        self._hand_thread.start()
+        self._segmentation_thread.start()
 
     @staticmethod
     def _push_latest(queue: Queue, item) -> None:
@@ -70,26 +77,37 @@ class VisionPipeline:
                 self._running = False
                 break
 
-            frame = cv2.resize(
-                frame,
-                (self.settings.frame_width, self.settings.frame_height),
-                interpolation=cv2.INTER_AREA,
-            )
+            target_size = (self.settings.frame_width, self.settings.frame_height)
+            if (frame.shape[1], frame.shape[0]) != target_size:
+                frame = cv2.resize(
+                    frame,
+                    target_size,
+                    interpolation=cv2.INTER_AREA,
+                )
 
-            self._push_latest(self.raw_frames_yolo, frame.copy())
-            self._push_latest(self.raw_frames_hands, frame)
+            self._push_latest(self.raw_frames_segmentation, frame)
 
-    def _yolo_loop(self) -> None:
+    def _segmentation_loop(self) -> None:
         last_log_time = perf_counter()
         frame_count = 0
 
-        while self._running or not self.raw_frames_yolo.empty():
+        while self._running or not self.raw_frames_segmentation.empty():
             try:
-                frame = self.raw_frames_yolo.get(timeout=0.2)
+                frame = self.raw_frames_segmentation.get(timeout=0.2)
             except Empty:
                 continue
 
-            annotated = self.processor.process(frame)
+            try:
+                start_time = perf_counter()
+                annotated = self.processor.process(frame)
+                process_time = perf_counter() - start_time
+            except Exception as exc:
+                self._worker_error = f"[YOLOE] Segmentation worker crashed: {exc}"
+                print(self._worker_error)
+                print(traceback.format_exc())
+                self._running = False
+                break
+
             self._push_latest(self.processed_frames, annotated)
 
             frame_count += 1
@@ -97,50 +115,41 @@ class VisionPipeline:
             elapsed = now - last_log_time
             if elapsed >= 1.0:
                 fps = frame_count / elapsed
-                print(f"Current FPS: {fps:.2f}")
+                print(
+                    f"[YOLOE] Segmentation FPS: {fps:.2f} | Avg latency: {(elapsed/frame_count)*1000:.1f}ms | Processed frames queue: {self.processed_frames.qsize()}"
+                )
                 frame_count = 0
                 last_log_time = now
-
-    def _hand_loop(self) -> None:
-        while self._running or not self.raw_frames_hands.empty():
-            try:
-                frame = self.raw_frames_hands.get(timeout=0.2)
-            except Empty:
-                continue
-
-            hand_points = self.hand_processor.detect(frame)
-            self._push_latest(self.hand_results, hand_points)
 
     def next_frame(self):
         while self._running or not self.processed_frames.empty():
             try:
                 frame = self.processed_frames.get(timeout=0.2)
             except Empty:
+                if self._worker_error and not self._error_reported:
+                    print(self._worker_error)
+                    self._error_reported = True
                 continue
-
-            while True:
-                try:
-                    self._latest_hands = self.hand_results.get_nowait()
-                except Empty:
-                    break
-
-            if self.settings.enable_hand_pose and self._latest_hands:
-                frame = self.hand_processor.draw(frame, self._latest_hands)
 
             return frame
 
+        if self._worker_error and not self._error_reported:
+            print(self._worker_error)
+            self._error_reported = True
+
         return None
+
+    def get_last_error(self) -> Optional[str]:
+        return self._worker_error
 
     def stop(self) -> None:
         self._running = False
 
         if self._read_thread is not None:
             self._read_thread.join(timeout=1.0)
-        if self._yolo_thread is not None:
-            self._yolo_thread.join(timeout=1.0)
-        if self._hand_thread is not None:
-            self._hand_thread.join(timeout=1.0)
+        if self._segmentation_thread is not None:
+            self._segmentation_thread.join(timeout=1.0)
 
+        self.processor.close()
         self.cap.release()
-        self.hand_processor.close()
         cv2.destroyAllWindows()

@@ -2,7 +2,7 @@ import cv2
 
 
 def open_camera(
-    stream_url: str, frame_width: int, frame_height: int
+    stream_url: str | int, frame_width: int, frame_height: int
 ) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(stream_url)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
