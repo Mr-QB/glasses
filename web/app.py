@@ -6,6 +6,7 @@ import cv2
 from flask import Flask, Response
 
 from vision.pipeline import VisionPipeline
+from voice.http_server import VoiceHTTPServer
 
 
 def _mjpeg_stream(pipeline: VisionPipeline) -> Iterator[bytes]:
@@ -22,7 +23,10 @@ def _mjpeg_stream(pipeline: VisionPipeline) -> Iterator[bytes]:
         yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + jpg_bytes + b"\r\n")
 
 
-def create_app(pipeline: VisionPipeline) -> Flask:
+def create_app(
+    pipeline: VisionPipeline,
+    voice_server: VoiceHTTPServer | None = None,
+) -> Flask:
     app = Flask(__name__)
 
     @app.route("/")
@@ -52,9 +56,14 @@ def create_app(pipeline: VisionPipeline) -> Flask:
 
     @app.route("/stream")
     def stream() -> Response:
+        # When a client subscribes to MJPEG, keep vision active so frames are available.
+        pipeline.activate(keepalive_seconds=0.0)
         return Response(
             _mjpeg_stream(pipeline),
             mimetype="multipart/x-mixed-replace; boundary=frame",
         )
+
+    if voice_server is not None:
+        voice_server.register_routes(app)
 
     return app

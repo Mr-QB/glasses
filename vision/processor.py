@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any, Iterable
 
 import cv2
@@ -62,6 +63,7 @@ class FrameProcessor:
         self.iou_threshold = iou_threshold
         self.max_det = max_det
         self.yoloe_prompts = self._normalize_prompts(yoloe_prompts)
+        self._prompt_lock = RLock()
         self.hand_pose: HandPoseProcessor | None = None
 
         self.enable_item_search = enable_item_search
@@ -143,7 +145,22 @@ class FrameProcessor:
                 f"[YOLOE] Cannot apply prompts ({type(exc).__name__}: {exc!r}). Running without open-vocab prompts."
             )
 
-    def _extract_masks(self, results: list[Any], frame_shape: tuple[int, int]) -> list[np.ndarray]:
+    def set_prompts(self, prompts: tuple[str, ...] | list[str] | str) -> None:
+        normalized_prompts = self._normalize_prompts(prompts)
+        with self._prompt_lock:
+            if normalized_prompts == self.yoloe_prompts:
+                return
+
+            self.yoloe_prompts = normalized_prompts
+            self._apply_open_vocab_prompts()
+            self._set_state(ItemSearchState.SEGMENT)
+            self._lost_frames = 0
+            self._last_object_center = None
+            self._last_command = "none"
+
+    def _extract_masks(
+        self, results: list[Any], frame_shape: tuple[int, int]
+    ) -> list[np.ndarray]:
         masks: list[np.ndarray] = []
         if not results:
             return masks
@@ -158,16 +175,25 @@ class FrameProcessor:
 
         mask_h, mask_w = frame_shape
         conf_values = None
-        if getattr(r0, "boxes", None) is not None and getattr(r0.boxes, "conf", None) is not None:
+        if (
+            getattr(r0, "boxes", None) is not None
+            and getattr(r0.boxes, "conf", None) is not None
+        ):
             conf_values = r0.boxes.conf
 
         for idx, mask_tensor in enumerate(mask_data):
-            conf = float(conf_values[idx].item()) if conf_values is not None and idx < len(conf_values) else 1.0
+            conf = (
+                float(conf_values[idx].item())
+                if conf_values is not None and idx < len(conf_values)
+                else 1.0
+            )
             if conf < self.conf_threshold:
                 continue
             mask_np = mask_tensor.detach().cpu().numpy()
             if mask_np.shape[:2] != (mask_h, mask_w):
-                mask_np = cv2.resize(mask_np, (mask_w, mask_h), interpolation=cv2.INTER_LINEAR)
+                mask_np = cv2.resize(
+                    mask_np, (mask_w, mask_h), interpolation=cv2.INTER_LINEAR
+                )
             mask_bin = (mask_np > 0.5).astype(np.uint8)
             if int(mask_bin.sum()) > 0:
                 masks.append(mask_bin)
@@ -175,7 +201,9 @@ class FrameProcessor:
 
     @staticmethod
     def _build_detected_object(mask_bin: np.ndarray) -> DetectedObject | None:
-        contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        contours, _ = cv2.findContours(
+            mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
         if not contours:
             return None
         contour = max(contours, key=cv2.contourArea)
@@ -186,7 +214,10 @@ class FrameProcessor:
         if abs(moments["m00"]) < 1e-6:
             center = tuple(np.mean(contour.reshape(-1, 2), axis=0).astype(int))
         else:
-            center = (int(moments["m10"] / moments["m00"]), int(moments["m01"] / moments["m00"]))
+            center = (
+                int(moments["m10"] / moments["m00"]),
+                int(moments["m01"] / moments["m00"]),
+            )
         return DetectedObject(
             mask=mask_bin,
             contour=contour.reshape(-1, 2),
@@ -212,7 +243,9 @@ class FrameProcessor:
         last = np.array(self._last_object_center, dtype=np.float32)
         return max(
             objects,
-            key=lambda obj: obj.area - 0.25 * float(np.linalg.norm(np.array(obj.center, dtype=np.float32) - last)),
+            key=lambda obj: obj.area
+            - 0.25
+            * float(np.linalg.norm(np.array(obj.center, dtype=np.float32) - last)),
         )
 
     def _reset_tracking_state(self) -> None:
@@ -282,7 +315,10 @@ class FrameProcessor:
                 if self._centered_frames >= self.center_hold_frames:
                     self._set_state(ItemSearchState.TRACK)
                     self._last_command = "track"
-                    return "target centered, switch to hand guidance", self._last_command
+                    return (
+                        "target centered, switch to hand guidance",
+                        self._last_command,
+                    )
                 self._last_command = "hold"
                 return (
                     f"target centered, hold still {self._centered_frames}/{self.center_hold_frames}",
@@ -311,19 +347,31 @@ class FrameProcessor:
 
         self._last_command = direction
         if is_touching:
-            return f"contact detected ({contact_ratio:.2f}), close hand to grasp", self._last_command
+            return (
+                f"contact detected ({contact_ratio:.2f}), close hand to grasp",
+                self._last_command,
+            )
         if extra:
             return f"move hand {direction}, {extra}", self._last_command
         return f"move hand {direction}", self._last_command
 
     @staticmethod
-    def _draw_object_overlay(frame: np.ndarray, detected_object: DetectedObject | None) -> None:
+    def _draw_object_overlay(
+        frame: np.ndarray, detected_object: DetectedObject | None
+    ) -> None:
         if detected_object is None:
             return
         overlay = frame.copy()
         overlay[detected_object.mask == 1] = (0, 255, 255)
         cv2.addWeighted(overlay, 0.35, frame, 0.65, 0.0, frame)
-        cv2.polylines(frame, [detected_object.contour.astype(np.int32)], True, (0, 255, 255), 3, cv2.LINE_AA)
+        cv2.polylines(
+            frame,
+            [detected_object.contour.astype(np.int32)],
+            True,
+            (0, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
         cv2.circle(frame, detected_object.center, 5, (0, 255, 0), -1, cv2.LINE_AA)
 
     def process(self, frame: Any) -> Any:

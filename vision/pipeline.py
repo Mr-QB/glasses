@@ -1,18 +1,26 @@
 import cv2
 import traceback
 from queue import Empty, Full, Queue
+from threading import RLock
 from threading import Thread
 from time import perf_counter
+from time import sleep
 from typing import Optional
 
 from vision.camera import open_camera
 from vision.processor import FrameProcessor
 from vision.settings import VisionSettings
+from shared.target_handoff import TargetHandoffBus
 
 
 class VisionPipeline:
     def __init__(self, settings: VisionSettings) -> None:
         self.settings = settings
+        self.target_bus: TargetHandoffBus | None = None
+        self._active = False
+        self._active_keepalive_s = max(0.0, float(settings.active_keepalive_seconds))
+        self._last_activity_ts = 0.0
+        self._activity_lock = RLock()
         self.cap = open_camera(
             settings.stream_url,
             frame_width=settings.frame_width,
@@ -46,6 +54,47 @@ class VisionPipeline:
         self._segmentation_thread: Optional[Thread] = None
         self._worker_error: Optional[str] = None
         self._error_reported = False
+        self._consecutive_read_failures = 0
+
+    def attach_target_bus(self, target_bus: TargetHandoffBus | None) -> None:
+        self.target_bus = target_bus
+
+    def activate(self, keepalive_seconds: float | None = None) -> None:
+        with self._activity_lock:
+            if keepalive_seconds is not None:
+                self._active_keepalive_s = max(0.0, float(keepalive_seconds))
+            self._active = True
+            self._last_activity_ts = perf_counter()
+
+    def deactivate(self) -> None:
+        with self._activity_lock:
+            self._active = False
+            self._last_activity_ts = 0.0
+        self._clear_queue(self.raw_frames_segmentation)
+        self._clear_queue(self.processed_frames)
+
+    def is_active(self) -> bool:
+        with self._activity_lock:
+            return self._active
+
+    def _refresh_active_state(self) -> bool:
+        with self._activity_lock:
+            if not self._active:
+                return False
+
+            keepalive = self._active_keepalive_s
+            if keepalive <= 0:
+                return True
+
+            if perf_counter() - self._last_activity_ts <= keepalive:
+                return True
+
+            self._active = False
+            self._last_activity_ts = 0.0
+
+        self._clear_queue(self.raw_frames_segmentation)
+        self._clear_queue(self.processed_frames)
+        return False
 
     def start(self) -> None:
         if self._running:
@@ -70,12 +119,67 @@ class VisionPipeline:
         except Full:
             pass
 
+    @staticmethod
+    def _clear_queue(queue: Queue) -> None:
+        while True:
+            try:
+                queue.get_nowait()
+            except Empty:
+                return
+
+    def _reopen_camera_with_backoff(self) -> bool:
+        delay_s = max(0.1, float(self.settings.reconnect_initial_delay_seconds))
+        max_delay_s = max(delay_s, float(self.settings.reconnect_max_delay_seconds))
+
+        while self._running:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
+            try:
+                self.cap = open_camera(
+                    self.settings.stream_url,
+                    frame_width=self.settings.frame_width,
+                    frame_height=self.settings.frame_height,
+                )
+                self._consecutive_read_failures = 0
+                print("[CAMERA] Reconnected stream successfully.")
+                return True
+            except Exception as exc:
+                print(
+                    f"[CAMERA] Reconnect failed: {exc}. " f"Retrying in {delay_s:.1f}s"
+                )
+                sleep(delay_s)
+                delay_s = min(max_delay_s, delay_s * 2.0)
+
+        return False
+
     def _read_loop(self) -> None:
         while self._running:
+            if not self._refresh_active_state():
+                sleep(0.05)
+                continue
+
             ret, frame = self.cap.read()
             if not ret:
-                self._running = False
-                break
+                self._consecutive_read_failures += 1
+                if (
+                    self._consecutive_read_failures
+                    >= self.settings.read_fail_reconnect_threshold
+                ):
+                    print(
+                        "[CAMERA] Read failures reached threshold "
+                        f"({self._consecutive_read_failures}). Attempting reconnect..."
+                    )
+                    if not self._reopen_camera_with_backoff():
+                        break
+                    continue
+
+                sleep(0.02)
+                continue
+
+            self._consecutive_read_failures = 0
 
             target_size = (self.settings.frame_width, self.settings.frame_height)
             if (frame.shape[1], frame.shape[0]) != target_size:
@@ -92,10 +196,24 @@ class VisionPipeline:
         frame_count = 0
 
         while self._running or not self.raw_frames_segmentation.empty():
+            if not self._refresh_active_state():
+                sleep(0.05)
+                continue
+
             try:
                 frame = self.raw_frames_segmentation.get(timeout=0.2)
             except Empty:
                 continue
+
+            if self.target_bus is not None:
+                target = self.target_bus.consume_latest()
+                if target is not None and target.normalized_label:
+                    print(
+                        "[YOLOE] apply extracted label="
+                        f"{target.normalized_label}"
+                        f" | confidence={target.confidence:.2f}"
+                    )
+                    self.processor.set_prompts([target.normalized_label])
 
             try:
                 start_time = perf_counter()

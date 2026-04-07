@@ -1,0 +1,9 @@
+pyttsx3==2.90
+flask==3.1.1
+numpy>=1.26.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+transformers>=4.40.0
+torch>=2.2.0
+accelerate>=0.28.0
+safetensors>=0.4.2
