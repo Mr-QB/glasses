@@ -213,6 +213,9 @@ class VisionPipeline:
 
             self._consecutive_read_failures = 0
 
+            # Preprocess: rotate frame 90 degrees clockwise before downstream processing.
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
             target_size = (self.settings.frame_width, self.settings.frame_height)
             if (frame.shape[1], frame.shape[0]) != target_size:
                 frame = cv2.resize(
