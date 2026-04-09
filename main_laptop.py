@@ -219,6 +219,7 @@ class LaptopNode:
                     )
 
                 if status == 422:
+                    self.guide_publisher.publish_guide("recall")
                     return {
                         "status": "no_label",
                         "code": "NO_LABEL_EXTRACTED",
@@ -229,6 +230,9 @@ class LaptopNode:
                         "message": "Audio was transcribed but no reliable object label was extracted",
                         "remote_response": remote_payload,
                     }, 422
+
+                if not activated:
+                    self.guide_publisher.publish_guide("recall")
 
                 return {
                     "status": "ok",
