@@ -238,8 +238,7 @@ class LaptopNode:
             f"label={target.label!r} normalized_label={target.normalized_label!r} "
             f"confidence={target.confidence:.2f}"
         )
-        self.target_bus.publish(target)
-        self.pipeline.activate(self.settings.active_keepalive_seconds)
+        self.pipeline.apply_target_handoff(target)
         print(
             f"[LAPTOP] Vision pipeline activated for "
             f"{self.settings.active_keepalive_seconds:.1f}s"

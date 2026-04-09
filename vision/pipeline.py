@@ -59,6 +59,27 @@ class VisionPipeline:
     def attach_target_bus(self, target_bus: TargetHandoffBus | None) -> None:
         self.target_bus = target_bus
 
+    def apply_target_handoff(self, target) -> None:
+        if target is None or not getattr(target, "normalized_label", None):
+            return
+
+        normalized_label = str(target.normalized_label).strip()
+        if not normalized_label:
+            return
+
+        print(
+            f"[YOLOE] apply target immediately: "
+            f"label={getattr(target, 'label', None)!r} "
+            f"normalized_label={normalized_label!r} "
+            f"confidence={getattr(target, 'confidence', 0.0):.2f}"
+        )
+
+        if self.target_bus is not None:
+            self.target_bus.publish(target)
+
+        self.processor.set_prompts([normalized_label])
+        self.activate(self.settings.active_keepalive_seconds)
+
     def activate(self, keepalive_seconds: float | None = None) -> None:
         with self._activity_lock:
             if keepalive_seconds is not None:
