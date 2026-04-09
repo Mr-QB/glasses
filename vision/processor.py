@@ -51,7 +51,7 @@ class FrameProcessor:
         track_lost_tolerance_frames: int = 10,
         contact_overlap_threshold: float = 0.12,
     ) -> None:
-        self.model = YOLOE(model_path, task="segment")
+        self.model_path = model_path
         self.device = self._resolve_device(device)
         self.use_fp16 = use_fp16 and self.device.startswith("cuda")
         if self.use_fp16:
@@ -81,9 +81,8 @@ class FrameProcessor:
         self._last_object_center: tuple[int, int] | None = None
         self._last_command = "none"
 
-        self.model.to(self.device)
+        self._load_model()
         print(f"YOLOE Segmentation device: {self.device} | fp16: {self.use_fp16}")
-        self._apply_open_vocab_prompts()
 
         if enable_hand_pose:
             self.hand_pose = HandPoseProcessor(
@@ -128,6 +127,12 @@ class FrameProcessor:
         )
         print("[YOLOE] Warmup done.")
 
+    def _load_model(self) -> None:
+        self.model = YOLOE(self.model_path, task="segment")
+        self.model.to(self.device)
+        self._apply_open_vocab_prompts()
+        self._warmup()
+
     def _apply_open_vocab_prompts(self) -> None:
         if not self.yoloe_prompts:
             print("[YOLOE] No prompt provided. Running as closed-set model.")
@@ -152,7 +157,7 @@ class FrameProcessor:
                 return
 
             self.yoloe_prompts = normalized_prompts
-            self._apply_open_vocab_prompts()
+            self._load_model()
             self._set_state(ItemSearchState.SEGMENT)
             self._lost_frames = 0
             self._last_object_center = None

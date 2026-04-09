@@ -11,7 +11,7 @@ from urllib.request import urlopen
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-DEFAULT_MODEL = "qwen3.5:4b"
+DEFAULT_MODEL = "gemma3:4b"
 
 
 def build_prompt(transcript: str) -> str:

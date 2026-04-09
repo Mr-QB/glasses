@@ -2,25 +2,24 @@
 AI Glasses Voice Server Node - STT + Ollama Processing
 
 Runs on remote server:
-  - Receives WAV audio from laptop via /transcribe endpoint
-  - Performs STT (Speech-to-Text) using PhoWhisper
-  - Extracts object labels using Ollama
-  - Sends label callbacks back to laptop /target_callback
+    - Receives WAV audio from laptop via /transcribe endpoint
+    - Performs STT (Speech-to-Text) using PhoWhisper
+    - Extracts object labels using Ollama
+    - Returns extraction result directly in /transcribe response
 
 Usage:
-  python main_voice_server.py \\n    --server-host 0.0.0.0 \\n    --server-port 5051 \\n    --laptop-callback-url http://127.0.0.1:5051/target_callback
+    python main_voice_server.py \
+        --server-host 0.0.0.0 \
+        --server-port 5051
 
 Endpoints:
-  POST /transcribe - Receive WAV, perform STT + Ollama, push callback
-  GET  /health     - Health check
+    POST /transcribe - Receive WAV, perform STT + Ollama, return response only
+    GET  /health     - Health check
 """
 
 import argparse
-import json
 from datetime import datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request
 
@@ -42,7 +41,6 @@ class VoiceServerNode:
         server_host: str = "0.0.0.0",
         server_port: int = 5051,
         save_dir: str = "raw_data/http_uploads",
-        laptop_callback_url: str = "",
         ollama_model: str = DEFAULT_MODEL,
         ollama_url: str = DEFAULT_OLLAMA_URL,
         ollama_timeout_seconds: float = 20.0,
@@ -50,10 +48,15 @@ class VoiceServerNode:
     ) -> None:
         self.server_host = server_host
         self.server_port = server_port
-        self.save_dir = Path(save_dir)
+        base_dir = Path(__file__).resolve().parent
+        configured_save_dir = Path(save_dir)
+        self.save_dir = (
+            configured_save_dir
+            if configured_save_dir.is_absolute()
+            else (base_dir / configured_save_dir)
+        )
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.laptop_callback_url = laptop_callback_url.rstrip("/")
         self.assistant = VoiceAssistant(
             stt_settings=STTSettings(device_preference="cuda"),
         )
@@ -76,7 +79,7 @@ class VoiceServerNode:
 
         @app.post("/transcribe")
         def transcribe() -> tuple[dict, int]:
-            """Receive WAV audio, perform STT + Ollama, send callback to laptop."""
+            """Receive WAV audio, perform STT + Ollama, return response only."""
             request_id = request.headers.get("X-Request-ID", "unknown")
             try:
                 audio_path = self._extract_audio_from_request(request_id)
@@ -91,6 +94,19 @@ class VoiceServerNode:
                         }
                     ),
                     400,
+                )
+            except OSError as exc:
+                return (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "code": "AUDIO_SAVE_FAILED",
+                            "error": str(exc),
+                            "request_id": request_id,
+                            "save_dir": str(self.save_dir),
+                        }
+                    ),
+                    500,
                 )
 
             try:
@@ -114,7 +130,7 @@ class VoiceServerNode:
     def _process_audio_path(
         self, audio_path: Path, request_id: str
     ) -> tuple[dict, bool]:
-        """Process WAV file: STT + Ollama, then callback to laptop."""
+        """Process WAV file: STT + Ollama, return payload."""
         print(f"[VOICE-STT@{request_id}] Processing {audio_path}")
 
         result = self.assistant.transcribe_file(audio_path)
@@ -185,50 +201,10 @@ class VoiceServerNode:
             },
         }
 
-        # Send callback to laptop with label
-        if has_label:
-            self._send_callback_to_laptop(request_id, target)
-        else:
-            print(
-                f"[VOICE@{request_id}] Skipping callback because no label was extracted"
-            )
+        if not has_label:
+            print(f"[VOICE@{request_id}] No label extracted; response-only mode")
 
         return response_payload, has_label
-
-    def _send_callback_to_laptop(self, request_id: str, target) -> None:
-        """Send label callback to laptop via HTTP POST."""
-        if not self.laptop_callback_url:
-            print(f"[VOICE@{request_id}] No laptop callback URL configured, skipping")
-            return
-
-        callback_payload = {
-            "request_id": request_id,
-            "target": {
-                "label": target.label,
-                "normalized_label": target.normalized_label,
-                "confidence": target.confidence,
-                "reason": target.reason,
-            },
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-        body = json.dumps(callback_payload).encode("utf-8")
-        req = Request(
-            self.laptop_callback_url,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Request-ID": request_id,
-            },
-            method="POST",
-        )
-
-        try:
-            with urlopen(req, timeout=10) as resp:
-                status = resp.status
-                print(f"[VOICE@{request_id}] Callback sent to laptop, status={status}")
-        except (HTTPError, URLError) as exc:
-            print(f"[VOICE@{request_id}] Callback to laptop failed: {exc}")
 
     def _extract_audio_from_request(self, request_id: str) -> Path:
         data = request.get_data(cache=False)
@@ -239,6 +215,7 @@ class VoiceServerNode:
         return self._write_audio(file_name, data)
 
     def _write_audio(self, file_name: str, audio_bytes: bytes) -> Path:
+        self.save_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         out_path = self.save_dir / f"{stamp}_{file_name}"
         out_path.write_bytes(audio_bytes)
@@ -265,11 +242,6 @@ def main():
         "--server-port", type=int, default=5051, help="Voice server port"
     )
     parser.add_argument(
-        "--laptop-callback-url",
-        default="",
-        help="Laptop callback endpoint URL (optional; leave empty when laptop is not publicly reachable)",
-    )
-    parser.add_argument(
         "--save-dir",
         default="raw_data/http_uploads",
         help="Directory to save uploaded audio files",
@@ -281,7 +253,6 @@ def main():
             server_host=args.server_host,
             server_port=args.server_port,
             save_dir=args.save_dir,
-            laptop_callback_url=args.laptop_callback_url,
         )
     except RuntimeError as exc:
         print(f"Failed to initialize voice server: {exc}")
@@ -294,10 +265,7 @@ def main():
     print(
         f"Transcribe:         POST http://{args.server_host}:{args.server_port}/transcribe"
     )
-    if args.laptop_callback_url:
-        print(f"Laptop callback:    {args.laptop_callback_url}")
-    else:
-        print("Laptop callback:    disabled (response-only mode)")
+    print("Mode:               response-only (no callback)")
     print(f"Health check:       http://{args.server_host}:{args.server_port}/health")
     print("Press Ctrl + C để thoát.")
     print("=" * 70)

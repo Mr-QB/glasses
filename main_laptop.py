@@ -5,8 +5,7 @@ Runs locally on laptop:
   - Streams MJPEG video from camera to browser
   - Receives WAV audio from ESP32 via /audio endpoint
   - Forwards audio to remote voice server
-  - Receives label callbacks from voice server
-  - Activates vision pipeline based on received labels
+    - Activates vision pipeline from remote response payload
 
 Usage:
     python main_laptop.py \\n    --laptop-host 0.0.0.0 \\n    --laptop-port 5051 \\n    --remote-voice-url https://voice.uet707e3.site
@@ -14,7 +13,6 @@ Usage:
 Endpoints:
   GET  /                - Video MJPEG stream
   POST /audio           - Audio ingress from ESP32 (WAV bytes)
-  POST /target_callback - Label callback from voice server (JSON)
   GET  /health          - Health check
 """
 
@@ -53,7 +51,7 @@ class LaptopNode:
         self.pipeline.attach_target_bus(self.target_bus)
 
     def setup_app(self):
-        """Create Flask app with vision stream + audio ingress + label callback."""
+        """Create Flask app with vision stream + audio ingress."""
         app = create_app(self.pipeline, voice_server=None)
 
         @app.post("/audio")
@@ -140,45 +138,6 @@ class LaptopNode:
             except Exception as exc:
                 return {"error": f"Internal gateway error: {exc}"}, 500
 
-        @app.post("/target_callback")
-        def receive_target_callback() -> tuple[dict, int]:
-            """
-            Receive label callback from remote voice server.
-            Expected JSON: {request_id, target: {normalized_label, confidence, ...}}
-            """
-            try:
-                if not self._request_has_json():
-                    return {"error": "Expected JSON payload"}, 400
-
-                payload = self._read_json_body()
-                request_id = payload.get("request_id")
-                target_data = payload.get("target", {})
-
-                if not request_id:
-                    return {"error": "Missing request_id"}, 400
-                if not target_data.get("normalized_label"):
-                    return {"error": "Target has no normalized_label"}, 400
-
-                # Build TargetHandoff and publish to local bus
-                target = TargetHandoff(
-                    label=target_data.get("label"),
-                    normalized_label=target_data.get("normalized_label"),
-                    confidence=target_data.get("confidence", 0.0),
-                    reason=target_data.get("reason"),
-                )
-                self.target_bus.publish(target)
-
-                # Activate vision pipeline
-                self.pipeline.activate(self.settings.active_keepalive_seconds)
-
-                return {
-                    "status": "ok",
-                    "request_id": request_id,
-                    "activated": True,
-                }, 200
-            except Exception as exc:
-                return {"error": f"Callback error: {exc}"}, 500
-
         @app.get("/health")
         def health() -> dict:
             return {
@@ -197,19 +156,6 @@ class LaptopNode:
         if not data:
             raise ValueError("Audio body is empty")
         return data
-
-    def _request_has_json(self) -> bool:
-        """Check if request has JSON content type."""
-        from flask import request
-
-        return request.is_json
-
-    def _read_json_body(self) -> dict:
-        """Read JSON body from request."""
-        from flask import request
-
-        payload = request.get_json(silent=True) or {}
-        return payload
 
     def _forward_to_remote_voice(
         self, audio_bytes: bytes, request_id: str
@@ -321,9 +267,6 @@ def main():
     print(f"Vision stream:      http://{args.laptop_host}:{args.laptop_port}/")
     print(
         f"Audio ingress:      http://{args.laptop_host}:{args.laptop_port}/audio (POST)"
-    )
-    print(
-        f"Target callback:    http://{args.laptop_host}:{args.laptop_port}/target_callback (POST)"
     )
     print(f"Remote voice:       {args.remote_voice_url}")
     print(f"Health check:       http://{args.laptop_host}:{args.laptop_port}/health")
