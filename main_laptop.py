@@ -174,6 +174,8 @@ class LaptopNode:
             try:
                 audio_bytes = self._extract_audio_body()
                 request_id = str(uuid.uuid4())
+                # Activate vision flow immediately when audio arrives, even before label extraction.
+                self.pipeline.activate(self.settings.active_keepalive_seconds)
 
                 # Forward to remote voice server
                 status, response = self._forward_to_remote_voice(
@@ -246,7 +248,7 @@ class LaptopNode:
                     "message": (
                         "Label received and vision activated"
                         if activated
-                        else "Remote completed but did not return target payload"
+                        else "Remote completed, vision remained active without new target payload"
                     ),
                     "remote_response": remote_payload,
                 }, 200
