@@ -78,7 +78,9 @@ class VoiceHTTPServer:
                 self.on_audio_received()
 
             try:
-                payload = self._process_audio_path(audio_path)
+                payload = self._process_audio_upload(audio_path)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
             except Exception as exc:
                 return jsonify({"error": str(exc)}), 500
 
@@ -87,8 +89,12 @@ class VoiceHTTPServer:
 
             return jsonify(payload), 200
 
-    def _process_audio_path(self, audio_path: Path) -> dict:
+    def _process_audio_upload(self, audio_path: Path) -> dict:
+        if audio_path.suffix.lower() != ".wav":
+            raise ValueError("Only WAV uploads are supported for /transcribe")
+
         result = self.assistant.transcribe_file(audio_path)
+
         print(f"[VOICE-STT] transcript: {result.text}")
 
         extraction: dict[str, object]
@@ -185,9 +191,18 @@ class VoiceHTTPServer:
         if not data:
             raise ValueError("Request body is empty")
 
-        header_name = request.headers.get("X-Filename", "audio.wav")
-        file_name = self._safe_filename(header_name)
+        file_name = self._infer_raw_upload_filename()
         return self._write_audio(file_name, data)
+
+    def _infer_raw_upload_filename(self) -> str:
+        header_name = request.headers.get("X-Filename", "")
+        if header_name:
+            safe_name = self._safe_filename(header_name)
+            if Path(safe_name).suffix.lower() == ".wav":
+                return safe_name
+            return f"{Path(safe_name).stem}.wav"
+
+        return "audio.wav"
 
     @staticmethod
     def _safe_filename(name: str) -> str:

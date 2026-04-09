@@ -1,3 +1,13 @@
+"""
+DEPRECATED: Unified architecture
+
+This file is kept for reference. Use instead:
+  - main_laptop.py: Vision pipeline + audio gateway (runs on laptop)
+  - main_voice_server.py: STT + Ollama processing (runs on server)
+
+See ARCHITECTURE.md for distributed 2-node setup.
+"""
+
 import argparse
 
 from web.app import create_app
@@ -11,7 +21,9 @@ from voice.settings import VoiceSettings
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AI Glasses camera preview")
+    parser = argparse.ArgumentParser(
+        description="AI Glasses camera preview (LEGACY - use main_laptop.py or main_voice_server.py)"
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Flask host")
     parser.add_argument("--port", type=int, default=5051, help="Flask port")
     args = parser.parse_args()
