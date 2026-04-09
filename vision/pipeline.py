@@ -5,7 +5,7 @@ from threading import RLock
 from threading import Thread
 from time import perf_counter
 from time import sleep
-from typing import Optional
+from typing import Callable, Optional
 
 from vision.camera import open_camera
 from vision.processor import FrameProcessor
@@ -14,7 +14,11 @@ from shared.target_handoff import TargetHandoffBus
 
 
 class VisionPipeline:
-    def __init__(self, settings: VisionSettings) -> None:
+    def __init__(
+        self,
+        settings: VisionSettings,
+        on_guidance_change: Callable[[str], None] | None = None,
+    ) -> None:
         self.settings = settings
         self.target_bus: TargetHandoffBus | None = None
         self._active = False
@@ -46,6 +50,13 @@ class VisionPipeline:
             hand_guidance_threshold_px=settings.hand_guidance_threshold_px,
             track_lost_tolerance_frames=settings.track_lost_tolerance_frames,
             contact_overlap_threshold=settings.contact_overlap_threshold,
+            occlusion_distance_threshold_px=settings.occlusion_distance_threshold_px,
+            occlusion_overlap_threshold=settings.occlusion_overlap_threshold,
+            occlusion_stable_frames=settings.occlusion_stable_frames,
+            occlusion_reacquire_wait_frames=settings.occlusion_reacquire_wait_frames,
+            occlusion_timeout_seconds=settings.occlusion_timeout_seconds,
+            forward_resume_hold_frames=settings.forward_resume_hold_frames,
+            on_guidance_change=on_guidance_change,
         )
         self.raw_frames_segmentation: Queue = Queue(maxsize=settings.queue_size)
         self.processed_frames: Queue = Queue(maxsize=settings.queue_size)

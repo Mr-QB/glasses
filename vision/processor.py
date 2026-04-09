@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import cv2
 import numpy as np
@@ -29,6 +30,8 @@ class DetectedObject:
 
 
 class FrameProcessor:
+    _GUIDANCE_IDS = {"left", "right", "up", "down", "forward", "none"}
+
     def __init__(
         self,
         model_path: str = "yolov8m-seg.pt",
@@ -50,6 +53,13 @@ class FrameProcessor:
         hand_guidance_threshold_px: int = 35,
         track_lost_tolerance_frames: int = 10,
         contact_overlap_threshold: float = 0.12,
+        occlusion_distance_threshold_px: int = 80,
+        occlusion_overlap_threshold: float = 0.12,
+        occlusion_stable_frames: int = 2,
+        occlusion_reacquire_wait_frames: int = 3,
+        occlusion_timeout_seconds: float = 3.0,
+        forward_resume_hold_frames: int = 2,
+        on_guidance_change: Callable[[str], None] | None = None,
     ) -> None:
         self.model_path = model_path
         self.device = self._resolve_device(device)
@@ -65,6 +75,7 @@ class FrameProcessor:
         self.yoloe_prompts = self._normalize_prompts(yoloe_prompts)
         self._prompt_lock = RLock()
         self.hand_pose: HandPoseProcessor | None = None
+        self._on_guidance_change = on_guidance_change
 
         self.enable_item_search = enable_item_search
         self.lock_required_frames = max(1, lock_required_frames)
@@ -73,13 +84,34 @@ class FrameProcessor:
         self.hand_guidance_threshold_px = max(1, hand_guidance_threshold_px)
         self.track_lost_tolerance_frames = max(1, track_lost_tolerance_frames)
         self.contact_overlap_threshold = max(0.0, min(1.0, contact_overlap_threshold))
+        self.occlusion_distance_threshold_px = max(1, occlusion_distance_threshold_px)
+        self.occlusion_overlap_threshold = max(
+            0.0, min(1.0, occlusion_overlap_threshold)
+        )
+        self.occlusion_stable_frames = max(1, occlusion_stable_frames)
+        self.occlusion_reacquire_wait_frames = max(1, occlusion_reacquire_wait_frames)
+        self.occlusion_timeout_seconds = max(0.1, float(occlusion_timeout_seconds))
+        self.forward_resume_hold_frames = max(0, forward_resume_hold_frames)
 
         self.state = ItemSearchState.SEGMENT
         self._stable_detection_frames = 0
         self._centered_frames = 0
         self._lost_frames = 0
         self._last_object_center: tuple[int, int] | None = None
+        self._last_visible_object_center: tuple[int, int] | None = None
+        self._last_hand_center: tuple[int, int] | None = None
+        self._last_contact_ratio = 0.0
+        self._overlap_evidence_frames = 0
+        self._occlusion_overlap_memory_frames = max(2, self.occlusion_stable_frames * 3)
+        self._forward_evidence_frames = 0
+        self._occlusion_candidate_frames = 0
+        self._occlusion_active = False
+        self._occlusion_active_since: float | None = None
+        self._occlusion_reference_center: tuple[int, int] | None = None
+        self._resume_forward_frames = 0
         self._last_command = "none"
+        self._last_update_ts: float | None = None
+        self._fps_ema = 0.0
 
         self._load_model()
         print(f"YOLOE Segmentation device: {self.device} | fp16: {self.use_fp16}")
@@ -179,7 +211,19 @@ class FrameProcessor:
             self._set_state(ItemSearchState.SEGMENT)
             self._lost_frames = 0
             self._last_object_center = None
+            self._last_visible_object_center = None
+            self._last_hand_center = None
+            self._last_contact_ratio = 0.0
+            self._overlap_evidence_frames = 0
+            self._forward_evidence_frames = 0
+            self._occlusion_candidate_frames = 0
+            self._occlusion_active = False
+            self._occlusion_active_since = None
+            self._occlusion_reference_center = None
+            self._resume_forward_frames = 0
             self._last_command = "none"
+            self._last_update_ts = None
+            self._fps_ema = 0.0
             print(
                 f"[YOLOE] Prompt switched successfully: {old_prompt_text} -> {new_prompt_text}"
             )
@@ -284,6 +328,115 @@ class FrameProcessor:
         self.state = state
         self._reset_tracking_state()
 
+    def _normalize_guidance_id(self, value: str | None) -> str:
+        if value is None:
+            return "none"
+        normalized = str(value).strip().lower()
+        if normalized in self._GUIDANCE_IDS:
+            return normalized
+        return "none"
+
+    def _clear_occlusion(self) -> None:
+        self._occlusion_candidate_frames = 0
+        self._occlusion_active = False
+        self._occlusion_active_since = None
+        self._occlusion_reference_center = None
+        self._resume_forward_frames = 0
+        self._overlap_evidence_frames = 0
+        self._forward_evidence_frames = 0
+
+    def _return_guidance(self, value: str | None) -> tuple[str, str]:
+        normalized = self._normalize_guidance_id(value)
+        previous = self._last_command
+        self._last_command = normalized
+        if (
+            normalized != previous
+            and self._on_guidance_change is not None
+        ):
+            try:
+                self._on_guidance_change(normalized)
+            except Exception as exc:
+                print(f"[GUIDE] on_guidance_change callback failed: {exc}")
+        if normalized == "forward":
+            base_frames = max(2, self.occlusion_stable_frames + 1)
+            if 0.0 < self._fps_ema <= 6.0:
+                base_frames = max(base_frames, 4)
+            self._forward_evidence_frames = base_frames
+        return normalized, normalized
+
+    def _update_fps_estimate(self, now: float) -> None:
+        if self._last_update_ts is None:
+            self._last_update_ts = now
+            return
+        dt = now - self._last_update_ts
+        self._last_update_ts = now
+        if dt <= 1e-6:
+            return
+        instant_fps = 1.0 / dt
+        if self._fps_ema <= 0.0:
+            self._fps_ema = instant_fps
+        else:
+            self._fps_ema = self._fps_ema * 0.85 + instant_fps * 0.15
+
+    def _effective_occlusion_stable_frames(self) -> int:
+        if 0.0 < self._fps_ema <= 6.0:
+            return 1
+        return self.occlusion_stable_frames
+
+    def _effective_occlusion_wait_frames(self) -> int:
+        if 0.0 < self._fps_ema <= 6.0:
+            return max(1, self.occlusion_reacquire_wait_frames - 1)
+        return self.occlusion_reacquire_wait_frames
+
+    def _enter_reacquire(self) -> tuple[str, str]:
+        self._set_state(ItemSearchState.SEGMENT)
+        self._stable_detection_frames = 0
+        self._centered_frames = 0
+        self._lost_frames = 0
+        self._clear_occlusion()
+        return self._return_guidance("none")
+
+    def _is_occlusion_candidate(
+        self,
+        hand_center: tuple[int, int] | None,
+        object_reference_center: tuple[int, int] | None,
+    ) -> bool:
+        if object_reference_center is None:
+            return False
+
+        effective_wait = self._effective_occlusion_wait_frames()
+        candidate_hand = hand_center
+        if (
+            candidate_hand is None
+            and self._last_hand_center is not None
+            and self._lost_frames <= effective_wait + 2
+        ):
+            candidate_hand = self._last_hand_center
+        if candidate_hand is None:
+            return False
+
+        distance = float(
+            np.hypot(
+                candidate_hand[0] - object_reference_center[0],
+                candidate_hand[1] - object_reference_center[1],
+            )
+        )
+        distance_threshold = float(self.occlusion_distance_threshold_px)
+        if 0.0 < self._fps_ema <= 6.0:
+            distance_threshold *= 1.35
+        is_near_last_object = distance <= distance_threshold
+        has_recent_overlap = (
+            self._last_contact_ratio >= self.occlusion_overlap_threshold
+            or self._overlap_evidence_frames > 0
+        )
+        has_recent_forward = (
+            self._forward_evidence_frames > 0
+            and self._lost_frames <= max(3, self.occlusion_stable_frames + 2)
+        )
+        if has_recent_overlap or has_recent_forward:
+            return is_near_last_object
+        return is_near_last_object and self._lost_frames >= effective_wait
+
     def _update_state_and_guidance(
         self,
         detected_object: DetectedObject | None,
@@ -293,43 +446,58 @@ class FrameProcessor:
     ) -> tuple[str, str]:
         frame_h, frame_w = frame_shape
         frame_center = (frame_w // 2, frame_h // 2)
+        now = perf_counter()
+        self._update_fps_estimate(now)
+
+        if hand_center is not None:
+            self._last_hand_center = hand_center
 
         if detected_object is None:
             self._lost_frames += 1
+            if self._overlap_evidence_frames > 0:
+                self._overlap_evidence_frames -= 1
+            if self._forward_evidence_frames > 0:
+                self._forward_evidence_frames -= 1
         else:
             self._lost_frames = 0
             self._last_object_center = detected_object.center
+            self._last_visible_object_center = detected_object.center
+            self._last_contact_ratio = estimate_contact_ratio(
+                hand_bbox, detected_object.mask
+            )
+            if self._last_contact_ratio >= self.occlusion_overlap_threshold:
+                self._overlap_evidence_frames = self._occlusion_overlap_memory_frames
+            elif self._overlap_evidence_frames > 0:
+                self._overlap_evidence_frames -= 1
 
-        if self._lost_frames >= self.track_lost_tolerance_frames:
+        if (
+            self._lost_frames >= self.track_lost_tolerance_frames
+            and not self._occlusion_active
+        ):
             self._set_state(ItemSearchState.SEGMENT)
             self._lost_frames = 0
+            self._clear_occlusion()
 
         if not self.enable_item_search:
-            self._last_command = "none"
-            return "item search disabled", self._last_command
+            return self._return_guidance("none")
 
         if self.state == ItemSearchState.SEGMENT:
+            self._clear_occlusion()
             if detected_object is None:
                 self._stable_detection_frames = 0
-                self._last_command = "none"
-                return "searching target object", self._last_command
+                return self._return_guidance("none")
 
             self._stable_detection_frames += 1
             if self._stable_detection_frames >= self.lock_required_frames:
                 self._set_state(ItemSearchState.CENTER_GUIDE)
-                self._last_command = "center"
-                return "target locked, center object in frame", self._last_command
+                return self._return_guidance("none")
 
-            self._last_command = "lock"
-            return (
-                f"locking target {self._stable_detection_frames}/{self.lock_required_frames}",
-                self._last_command,
-            )
+            return self._return_guidance("none")
 
         if self.state == ItemSearchState.CENTER_GUIDE:
+            self._clear_occlusion()
             if detected_object is None:
-                self._last_command = "reacquire"
-                return "target lost, reacquiring", self._last_command
+                return self._return_guidance("none")
 
             direction, centered, distance = get_center_guidance(
                 detected_object.center,
@@ -340,46 +508,80 @@ class FrameProcessor:
                 self._centered_frames += 1
                 if self._centered_frames >= self.center_hold_frames:
                     self._set_state(ItemSearchState.TRACK)
-                    self._last_command = "track"
-                    return (
-                        "target centered, switch to hand guidance",
-                        self._last_command,
-                    )
-                self._last_command = "hold"
-                return (
-                    f"target centered, hold still {self._centered_frames}/{self.center_hold_frames}",
-                    self._last_command,
-                )
+                    return self._return_guidance("none")
+                return self._return_guidance("none")
 
             self._centered_frames = 0
-            self._last_command = direction or "center"
-            return f"move camera {direction} ({int(distance)}px)", self._last_command
+            return self._return_guidance(direction)
 
         if detected_object is None:
-            self._last_command = "reacquire"
-            return "target lost, reacquiring", self._last_command
+            reference_center = self._last_visible_object_center
+            if reference_center is None:
+                return self._return_guidance("none")
 
-        contact_ratio = estimate_contact_ratio(hand_bbox, detected_object.mask)
+            candidate = self._is_occlusion_candidate(hand_center, reference_center)
+
+            if candidate:
+                self._occlusion_candidate_frames += 1
+            else:
+                self._occlusion_candidate_frames = 0
+
+            required_stable_frames = self._effective_occlusion_stable_frames()
+            if self._lost_frames >= self._effective_occlusion_wait_frames():
+                # Đã chờ đủ frame reacquire mà vẫn mất vật -> ưu tiên tiến tay lên.
+                required_stable_frames = 1
+                if self._occlusion_candidate_frames == 0:
+                    self._occlusion_candidate_frames = 1
+
+            if (
+                not self._occlusion_active
+                and self._occlusion_candidate_frames >= required_stable_frames
+            ):
+                self._occlusion_active = True
+                self._occlusion_active_since = now
+                self._occlusion_reference_center = reference_center
+
+            if self._occlusion_active:
+                if self._occlusion_reference_center is None:
+                    self._occlusion_reference_center = reference_center
+                return self._return_guidance("forward")
+
+            return self._return_guidance("none")
+
+        contact_ratio = self._last_contact_ratio
         is_touching = contact_ratio >= self.contact_overlap_threshold
-        direction, extra = get_hand_guidance(
+
+        if self._occlusion_active:
+            reference_center = self._occlusion_reference_center
+            self._clear_occlusion()
+            if reference_center is not None:
+                reappear_distance = float(
+                    np.hypot(
+                        detected_object.center[0] - reference_center[0],
+                        detected_object.center[1] - reference_center[1],
+                    )
+                )
+                if reappear_distance <= self.hand_guidance_threshold_px:
+                    self._resume_forward_frames = self.forward_resume_hold_frames
+
+        if self._resume_forward_frames > 0:
+            self._resume_forward_frames -= 1
+            return self._return_guidance("forward")
+
+        if hand_center is None:
+            return self._return_guidance("none")
+
+        direction, _ = get_hand_guidance(
             hand_center,
             detected_object.center,
             threshold_px=self.hand_guidance_threshold_px,
             is_touching=is_touching,
         )
-        if direction is None:
-            self._last_command = "show hand"
-            return "show hand in frame", self._last_command
 
-        self._last_command = direction
-        if is_touching:
-            return (
-                f"contact detected ({contact_ratio:.2f}), close hand to grasp",
-                self._last_command,
-            )
-        if extra:
-            return f"move hand {direction}, {extra}", self._last_command
-        return f"move hand {direction}", self._last_command
+        if direction is None:
+            return self._return_guidance("none")
+
+        return self._return_guidance(direction)
 
     @staticmethod
     def _draw_object_overlay(
