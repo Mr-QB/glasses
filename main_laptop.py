@@ -8,7 +8,7 @@ Runs locally on laptop:
     - Activates vision pipeline from remote response payload
 
 Usage:
-    python main_laptop.py \\n    --laptop-host 0.0.0.0 \\n    --laptop-port 5051 \\n    --remote-voice-url https://voice.uet707e3.site
+    python main_laptop.py \\n    --laptop-host 0.0.0.0 \\n    --laptop-port 5052 \\n    --remote-voice-url https://voice.uet707e3.site
 
 Endpoints:
   GET  /                - Video MJPEG stream
@@ -37,7 +37,7 @@ class LaptopNode:
     def __init__(
         self,
         laptop_host: str = "0.0.0.0",
-        laptop_port: int = 5051,
+        laptop_port: int = 5052,
         remote_voice_url: str = "https://voice.uet707e3.site",
     ):
         self.laptop_host = laptop_host
@@ -227,11 +227,15 @@ class LaptopNode:
         if not normalized_label:
             return False, None
 
+        transcript = str(payload.get("text") or "").strip()
+
         target = TargetHandoff(
             label=target_data.get("label"),
             normalized_label=normalized_label,
             confidence=target_data.get("confidence", 0.0),
+            transcript=transcript,
             reason=target_data.get("reason"),
+            raw_output=response_text(payload),
         )
         print(
             f"[LAPTOP] Applying target from voice server: "
@@ -246,13 +250,21 @@ class LaptopNode:
         return True, str(normalized_label)
 
 
+def response_text(payload: dict[str, Any]) -> str | None:
+    text = payload.get("text")
+    if text is None:
+        return None
+    text_value = str(text).strip()
+    return text_value or None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AI Glasses Laptop Node (Vision + Audio Gateway)"
     )
     parser.add_argument("--laptop-host", default="0.0.0.0", help="Laptop Flask host")
     parser.add_argument(
-        "--laptop-port", type=int, default=5051, help="Laptop Flask port"
+        "--laptop-port", type=int, default=5052, help="Laptop Flask port"
     )
     parser.add_argument(
         "--remote-voice-url",

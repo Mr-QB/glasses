@@ -24,7 +24,7 @@ def build_prompt(transcript: str) -> str:
         "{\n"
         '  "object": "tên đồ vật ngắn gọn hoặc null",\n'
         '  "normalized_object": "tên chuẩn hoá ngắn gọn hoặc null",\n'
-        '  "confidence": 0.0,\n'
+        '  "confidence": 0.1,\n'
         '  "reason": "lý do ngắn gọn"\n'
         "}\n"
         "Nếu không xác định được đồ vật thì object và normalized_object phải là null.\n"
@@ -39,7 +39,7 @@ def parse_ollama_output(raw_text: str) -> dict:
         return {
             "object": None,
             "normalized_object": None,
-            "confidence": 0.0,
+            "confidence": 0.1,
             "reason": "Ollama did not return valid JSON",
             "raw_output": raw_text,
         }
