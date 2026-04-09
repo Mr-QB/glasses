@@ -19,12 +19,13 @@ Endpoints:
 """
 
 import argparse
+import http.client
 import json
+import socket
 import uuid
 from datetime import datetime
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
 from web.app import create_app
 from vision.pipeline import VisionPipeline
@@ -128,6 +129,14 @@ class LaptopNode:
                 }, 200
             except ValueError as exc:
                 return {"error": str(exc)}, 400
+            except RuntimeError as exc:
+                return {
+                    "status": "error",
+                    "code": "REMOTE_VOICE_UNREACHABLE",
+                    "request_id": request_id,
+                    "message": str(exc),
+                    "remote_url": self.remote_voice_url,
+                }, 502
             except Exception as exc:
                 return {"error": f"Internal gateway error: {exc}"}, 500
 
@@ -206,29 +215,55 @@ class LaptopNode:
         self, audio_bytes: bytes, request_id: str
     ) -> tuple[int, str]:
         """Forward audio to remote voice server, get response."""
-        url = f"{self.remote_voice_url}/transcribe"
+        parsed = urlparse(self.remote_voice_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise RuntimeError(
+                f"Invalid remote voice URL: {self.remote_voice_url}. "
+                "Expected format: http(s)://host[:port]"
+            )
 
-        req = Request(
-            url,
-            data=audio_bytes,
-            headers={
-                "Content-Type": "audio/wav",
-                "X-Request-ID": request_id,
-                "X-Filename": f"audio_{request_id}.wav",
-            },
-            method="POST",
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path_prefix = parsed.path.rstrip("/")
+        endpoint_path = f"{path_prefix}/transcribe" if path_prefix else "/transcribe"
+
+        headers = {
+            "Host": parsed.netloc,
+            "Content-Type": "audio/wav",
+            "Content-Length": str(len(audio_bytes)),
+            "X-Request-ID": request_id,
+            "X-Filename": f"audio_{request_id}.wav",
+            "Connection": "close",
+        }
+
+        connection_cls = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
         )
+        connection = connection_cls(host, port, timeout=30)
 
         try:
-            with urlopen(req, timeout=30) as resp:
-                status = resp.status
-                text = resp.read().decode("utf-8", errors="replace")
-                return status, text
-        except HTTPError as exc:
-            text = exc.read().decode("utf-8", errors="replace")
-            return exc.code, text
-        except URLError as exc:
+            print(
+                f"[LAPTOP->VOICE@{request_id}] "
+                f"POST {parsed.scheme}://{parsed.netloc}{endpoint_path} "
+                f"| bytes={len(audio_bytes)}"
+            )
+            connection.request(
+                "POST",
+                endpoint_path,
+                body=audio_bytes,
+                headers=headers,
+            )
+            response = connection.getresponse()
+            status = int(response.status)
+            text = response.read().decode("utf-8", errors="replace")
+            print(f"[LAPTOP->VOICE@{request_id}] status={status}")
+            return status, text
+        except (socket.timeout, ConnectionError, OSError) as exc:
             raise RuntimeError(f"Failed to reach remote voice server: {exc}") from exc
+        finally:
+            connection.close()
 
     def _apply_target_from_payload(
         self, payload: dict[str, Any]
