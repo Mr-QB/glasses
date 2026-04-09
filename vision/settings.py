@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class VisionSettings:
-    stream_url: str = "http://100.123.237.23:8080/video"
+    stream_url: str = "http://172.20.10.2/stream"
     model_path: str = "models/yoloe-11l-seg.pt"
     window_name: str = "AI Glasses Camera"
     frame_width: int = 640
@@ -15,7 +15,7 @@ class VisionSettings:
     conf_threshold: float = 0.4
     iou_threshold: float = 0.6
     max_det: int = 50
-    yoloe_prompts: tuple[str, ...] = ("cup",)
+    yoloe_prompts: tuple[str, ...] = ("cell phone",)
     enable_hand_pose: bool = True
     max_num_hands: int = 2
     hand_detection_confidence: float = 0.5

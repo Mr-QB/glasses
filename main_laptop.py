@@ -233,6 +233,8 @@ class LaptopNode:
 
                 if not activated:
                     self.guide_publisher.publish_guide("recall")
+                else:
+                    self.guide_publisher.publish_guide("done_call")
 
                 return {
                     "status": "ok",
