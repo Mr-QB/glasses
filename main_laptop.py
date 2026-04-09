@@ -72,6 +72,11 @@ class LaptopNode:
                 except Exception:
                     remote_payload = None
 
+                print(
+                    f"[LAPTOP<-VOICE@{request_id}] "
+                    f"status={status} payload={remote_payload if remote_payload is not None else response!r}"
+                )
+
                 if status >= 500:
                     return {
                         "status": "error",
@@ -228,8 +233,17 @@ class LaptopNode:
             confidence=target_data.get("confidence", 0.0),
             reason=target_data.get("reason"),
         )
+        print(
+            f"[LAPTOP] Applying target from voice server: "
+            f"label={target.label!r} normalized_label={target.normalized_label!r} "
+            f"confidence={target.confidence:.2f}"
+        )
         self.target_bus.publish(target)
         self.pipeline.activate(self.settings.active_keepalive_seconds)
+        print(
+            f"[LAPTOP] Vision pipeline activated for "
+            f"{self.settings.active_keepalive_seconds:.1f}s"
+        )
         return True, str(normalized_label)
 
 

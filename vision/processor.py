@@ -128,10 +128,15 @@ class FrameProcessor:
         print("[YOLOE] Warmup done.")
 
     def _load_model(self) -> None:
+        prompt_text = ", ".join(self.yoloe_prompts) if self.yoloe_prompts else "none"
+        print(
+            f"[YOLOE] Reloading model from {self.model_path} with prompts: {prompt_text}"
+        )
         self.model = YOLOE(self.model_path, task="segment")
         self.model.to(self.device)
         self._apply_open_vocab_prompts()
         self._warmup()
+        print(f"[YOLOE] Model reload complete for prompts: {prompt_text}")
 
     def _apply_open_vocab_prompts(self) -> None:
         if not self.yoloe_prompts:
@@ -154,14 +159,30 @@ class FrameProcessor:
         normalized_prompts = self._normalize_prompts(prompts)
         with self._prompt_lock:
             if normalized_prompts == self.yoloe_prompts:
+                print(
+                    f"[YOLOE] Prompt unchanged, keeping current label: "
+                    f"{', '.join(self.yoloe_prompts) if self.yoloe_prompts else 'none'}"
+                )
                 return
 
+            old_prompt_text = (
+                ", ".join(self.yoloe_prompts) if self.yoloe_prompts else "none"
+            )
+            new_prompt_text = (
+                ", ".join(normalized_prompts) if normalized_prompts else "none"
+            )
+            print(
+                f"[YOLOE] Prompt update requested: {old_prompt_text} -> {new_prompt_text}"
+            )
             self.yoloe_prompts = normalized_prompts
             self._load_model()
             self._set_state(ItemSearchState.SEGMENT)
             self._lost_frames = 0
             self._last_object_center = None
             self._last_command = "none"
+            print(
+                f"[YOLOE] Prompt switched successfully: {old_prompt_text} -> {new_prompt_text}"
+            )
 
     def _extract_masks(
         self, results: list[Any], frame_shape: tuple[int, int]
