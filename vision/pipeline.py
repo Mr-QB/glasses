@@ -132,6 +132,8 @@ class VisionPipeline:
         if self._running:
             return
 
+        # Start active by default so hand detection/guidance runs without any request trigger.
+        self.activate(self.settings.active_keepalive_seconds)
         self._running = True
         self._read_thread = Thread(target=self._read_loop, daemon=True)
         self._segmentation_thread = Thread(target=self._segmentation_loop, daemon=True)
